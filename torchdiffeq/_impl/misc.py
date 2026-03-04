@@ -348,13 +348,11 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
                 # At the moment all callbacks have the arguments (t0, y0, dt).
                 # These will need adjusting on a per-callback basis if that changes in the future.
                 if is_tuple:
-
                     def callback(t0, y0, dt, _callback=callback):
                         y0 = _flat_to_shape(y0, (), shapes)
                         return _callback(t0, y0, dt)
 
                 if t_is_reversed:
-
                     def callback(t0, y0, dt, _callback=callback):
                         return _callback(-t0, y0, dt)
 
