@@ -1,7 +1,17 @@
 import abc
+from functools import partial
+
 import torch
 from .event_handling import find_event
 from .misc import _handle_unused_kwargs
+from .jump import JumpMechanism
+
+
+def next_after(x: torch.Tensor) -> torch.Tensor:
+    """
+    Returns the next representable floating-point value after x in the direction of infinity.
+    """
+    return torch.nextafter(x, torch.tensor(torch.inf, device=x.device, dtype=x.dtype))
 
 
 class AdaptiveStepsizeODESolver(metaclass=abc.ABCMeta):
@@ -54,17 +64,18 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
     order: int
 
     def __init__(
-            self,
-            func,
-            y0,
-            step_size=None,
-            grid_constructor=None,
-            interp="linear",
-            perturb=False,
-            jump_t=None,
-            events=None,
-            jump=None,
-            **unused_kwargs,
+        self,
+        func,
+        y0,
+        step_size=None,
+        grid_constructor=None,
+        interp="linear",
+        perturb=False,
+        jump_t=None,
+        events=None,
+        jump=None,
+        jump_mechanism=None,
+        **unused_kwargs,
     ):
         self.atol = unused_kwargs.pop("atol")
         unused_kwargs.pop("rtol", None)
@@ -85,6 +96,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
             else torch.tensor([], dtype=self.dtype, device=self.device)
         )
         self.jump = jump
+        self.jump_mechanism = jump_mechanism
         self.events = (
             torch.as_tensor(events, dtype=self.y0.dtype, device=self.device)
             if events is not None
@@ -116,8 +128,8 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
 
             niters = torch.ceil((end_time - start_time) / step_size + 1).item()
             t_infer = (
-                    torch.arange(0, niters, dtype=t.dtype, device=t.device) * step_size
-                    + start_time
+                torch.arange(0, niters, dtype=t.dtype, device=t.device) * step_size
+                + start_time
             )
             t_infer[-1] = t[-1]
 
@@ -128,6 +140,10 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def _step_func(self, func, t0, dt, t1, y0):
         pass
+
+    @property
+    def _has_jumps(self):
+        return self.jump is not None or self.jump_mechanism is not None
 
     def integrate(self, t):
         event_index = 0
@@ -150,31 +166,38 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
             self.func.callback_step(t0, y0, dt)
             dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
             y1 = y0 + dy
-
+            t_event = t0
             while j < len(t) and t1 >= t[j]:
                 if self.interp == "linear":
-                    dJ1, event_index = self._linear_interp_events(
-                        t0, t1, y0, y1, t[j], event_index
-                    )
-                    dJ += dJ1
+                    if self._has_jumps:
+                        _, t_event, event_index = self._linear_interp_events(
+                            t0, t1, y0, y1, next_after(t_event), t[j], event_index, dJ
+                        )
                     solution[j] = self._linear_interp(t0, t1, y0, y1, t[j]) + dJ
-                    dJ2, event_index = self._linear_interp_events(
-                        t0, t1, y0, y1, t1, event_index
-                    )
-                    dJ += dJ2
+                    if self._has_jumps:
+                        _, t_event, event_index = self._linear_interp_events(
+                            t0,
+                            t1,
+                            y0,
+                            y1,
+                            next_after(t_event),
+                            next_after(t1),
+                            event_index,
+                            dJ,
+                        )
                 elif self.interp == "cubic":
                     f1 = self.func(t1, y1)
-                    dJ1, event_index = self._cubic_hermite_events(
-                        t0, y0, f0, t1, y1, f1, t[j], event_index
-                    )
-                    dJ += dJ1
+                    if self._has_jumps:
+                        _, t_event, event_index = self._cubic_hermite_events(
+                            t0, y0, f0, t1, y1, f1, t_event, t[j], event_index
+                        )
                     solution[j] = (
-                            self._cubic_hermite_interp(t0, y0, f0, t1, y1, f1, t[j]) + dJ
+                        self._cubic_hermite_interp(t0, y0, f0, t1, y1, f1, t[j]) + dJ
                     )
-                    dJ2, event_index = self._cubic_hermite_events(
-                        t0, y0, f0, t1, y1, f1, t1, event_index
-                    )
-                    dJ += dJ2
+                    if self._has_jumps:
+                        _, t_event, event_index = self._cubic_hermite_events(
+                            t0, y0, f0, t1, y1, f1, t_event, next_after(t1), event_index
+                        )
 
                 else:
                     raise ValueError(f"Unknown interpolation method {self.interp}")
@@ -185,7 +208,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
 
     def integrate_until_event(self, t0, event_fn):
         assert (
-                self.step_size is not None
+            self.step_size is not None
         ), "Event handling for fixed step solvers currently requires `step_size` to be provided in options."
 
         t0 = t0.type_as(self.y0.abs())
@@ -242,26 +265,88 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         slope = (t - t0) / (t1 - t0)
         return y0 + slope * (y1 - y0)
 
-    def _linear_interp_events(self, t0, t1, y0, y1, t_lim, e_index):
-        dJ = torch.zeros_like(y0)
-        while e_index < len(self.jump_t) and t_lim >= self.jump_t[e_index]:
-            y_event = self._linear_interp(t0, t1, y0, y1, self.jump_t[e_index])
-            h = self.jump(self.jump_t[e_index], y_event)
-            dN = self.events[:, e_index]
-            shape = list(dN.shape) + [1 for _ in range(len(h.shape) - len(dN.shape))]
-            dJ += h * dN.reshape(shape)
-            e_index += 1
-        return dJ, e_index
+    def _linear_interp_events(
+        self, t0, t1, y0, y1, t_start, t_end, e_index, dJ: torch.Tensor
+    ):
+        def _linear_interp_with_jump(*args, dJ):
+            return self._linear_interp(*args) + dJ
 
-    def _cubic_hermite_events(self, t0, y0, f0, t1, y1, f1, t_lim, e_index):
+        # interp = partial(self._linear_interp, t0, t1, y0, y1)
+        # dJ = torch.zeros_like(y0)
+        interp = partial(_linear_interp_with_jump, t0, t1, y0, y1, dJ=dJ)
+        if isinstance(self.jump_mechanism, JumpMechanism):
+            t_event = self.jump_mechanism.find_event_time(interp, t_start, t_end)
+            while t_event < t_end:
+                dN = self.jump_mechanism.realise_event(t_event, interp(t_event))
+                dN = (
+                    dN[..., None, :]
+                    if self.jump_mechanism.kind == "coupled"
+                    else dN[..., None]
+                )
+                # If marked, shape of dN is (B...,n_events), else (B...)
+                y_event = interp(t_event)
+                # z.shape = (B...,L) Where L is the latent dimension
+                # If marked, shape of h is (B...,L,n_events), else (B...,L)
+                h = self.jump(
+                    t_event, self.jump_mechanism.latent_proj(y_event, enforce=False)
+                )
+                # If marked, the einsum will be a dot-like product, else a pointwise multiplication
+                jmp = h * dN
+                if self.jump_mechanism.kind == "coupled":
+                    jmp = jmp.sum(dim=-1)
+                # Apply the projection to the latent space. Projection MUST BE A VIEW OPERATION.
+                dJ_proj = self.jump_mechanism.latent_proj(dJ, enforce=True)
+                dJ_proj += jmp
+                t_event = self.jump_mechanism.find_event_time(
+                    interp, next_after(t_event), t_end
+                )
+            return dJ, t_event, None
+        else:
+            while e_index < len(self.jump_t) and t_end >= self.jump_t[e_index]:
+                y_event = interp(self.jump_t[e_index])
+                h = self.jump(self.jump_t[e_index], y_event)
+                dN = self.events[:, e_index]
+                shape = list(dN.shape) + [
+                    1 for _ in range(len(h.shape) - len(dN.shape))
+                ]
+                dJ += h * dN.reshape(shape)
+                e_index += 1
+            return dJ, None, e_index
+
+    def _cubic_hermite_events(self, t0, y0, f0, t1, y1, f1, t_start, t_end, e_index):
+        interp = partial(self._cubic_hermite_interp, t0, y0, f0, t1, y1, f1)
         dJ = torch.zeros_like(y0)
-        while e_index < len(self.jump_t) and t_lim >= self.jump_t[e_index]:
-            y_event = self._cubic_hermite_interp(
-                t0, y0, f0, t1, y1, f1, self.jump_t[e_index]
-            )
-            h = self.jump(self.jump_t[e_index], y_event)
-            dN = self.events[:, e_index]
-            shape = list(dN.shape) + [1 for _ in range(len(h.shape) - len(dN.shape))]
-            dJ += h * dN.reshape(shape)
-            e_index += 1
-        return dJ, e_index
+
+        if isinstance(self.jump_mechanism, JumpMechanism):
+            t_event = self.jump_mechanism.find_event_time(interp, t_start, t_end)
+            while t_event < t_end:
+                dN = self.jump_mechanism.realise_event(t_event, interp(t_event))
+                dN = (
+                    dN[..., None, :]
+                    if self.jump_mechanism.kind == "coupled"
+                    else dN[..., None]
+                )
+                y_event = interp(t_event)
+                h = self.jump(
+                    t_event, self.jump_mechanism.latent_proj(y_event, enforce=False)
+                )
+                jmp = h * dN
+                if self.jump_mechanism.kind == "coupled":
+                    jmp = jmp.sum(dim=-1)
+                dJ_proj = self.jump_mechanism.latent_proj(dJ, enforce=True)
+                dJ_proj += jmp[..., None]
+                t_event = self.jump_mechanism.find_event_time(
+                    interp, next_after(t_event), t_end
+                )
+            return dJ, t_event, e_index
+        else:
+            while e_index < len(self.jump_t) and t_end >= self.jump_t[e_index]:
+                y_event = interp(self.jump_t[e_index])
+                h = self.jump(self.jump_t[e_index], y_event)
+                dN = self.events[:, e_index]
+                shape = list(dN.shape) + [
+                    1 for _ in range(len(h.shape) - len(dN.shape))
+                ]
+                dJ += h * dN.reshape(shape)
+                e_index += 1
+            return dJ, None, e_index
