@@ -351,6 +351,8 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         # y0_m = y_0(-)
         if dt > 0:
             y0 = y0_m + dJ  # Issue Jump
+        else:
+            y0 = y0_m
         if not torch.isfinite(dt):
             dt = self.min_step
         dt = dt.clamp(self.min_step, self.max_step)
@@ -496,6 +498,9 @@ class FixedGridFIRKODESolver(FixedGridODESolver):
             interp="linear",
             perturb=False,
             max_iters=100,
+            jump_t=None,
+            events=None,
+            jump=None,
             **unused_kwargs
     ):
         self.max_iters = max_iters
@@ -512,6 +517,13 @@ class FixedGridFIRKODESolver(FixedGridODESolver):
         self.step_size = step_size
         self.interp = interp
         self.perturb = perturb
+        self.jump_t = (
+            torch.as_tensor(jump_t, device=self.device, dtype=self.dtype)
+            if jump_t is not None
+            else torch.as_tensor([], device=self.device, dtype=self.dtype)
+        )
+        self.events = events
+        self.jump = jump
 
         if step_size is None:
             if grid_constructor is None:
