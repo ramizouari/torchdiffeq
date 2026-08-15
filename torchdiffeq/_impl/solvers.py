@@ -1,10 +1,9 @@
 import abc
-from functools import partial
 
 import torch
 from .event_handling import find_event
 from .misc import _handle_unused_kwargs
-from .jump import JumpMechanism
+from .jump import MAX_EVENTS_PER_STEP, FixedJumpMechanism, JumpMechanism
 
 
 def next_after(x: torch.Tensor) -> torch.Tensor:
@@ -12,6 +11,51 @@ def next_after(x: torch.Tensor) -> torch.Tensor:
     Returns the next representable floating-point value after x in the direction of infinity.
     """
     return torch.nextafter(x, torch.tensor(torch.inf, device=x.device, dtype=x.dtype))
+
+
+def _resolve_jump_mechanism(jump, jump_t, events, jump_mechanism):
+    """Normalise the two jump APIs onto a single :class:`JumpMechanism`.
+
+    The original API takes a `jump` network plus prescribed `jump_t` times and a
+    per-time `events` indicator; that is exactly a `FixedJumpMechanism` in
+    uncoupled mode whose jump lands on the whole state, so it is expressed as
+    one rather than kept as a second code path.
+
+    Passing `jump_t` on its own keeps its upstream meaning - a discontinuity in
+    `f` that the grid should land on - and produces no state jump.
+    """
+    if jump_mechanism is not None:
+        if not isinstance(jump_mechanism, JumpMechanism):
+            raise TypeError(
+                "`jump_mechanism` must be a JumpMechanism, got "
+                f"{type(jump_mechanism).__name__}."
+            )
+        if jump is None:
+            raise ValueError(
+                "`jump_mechanism` was given without `jump`: there is no jump "
+                "network to evaluate when an event fires."
+            )
+        if events is not None:
+            raise ValueError(
+                "`events` and `jump_mechanism` are mutually exclusive; the "
+                "mechanism already decides which events fire."
+            )
+        return jump_mechanism
+
+    if events is not None:
+        if jump is None or jump_t is None:
+            raise ValueError(
+                "`events` requires both `jump` and `jump_t`: they specify the "
+                "jump network and the times its events occur at."
+            )
+        return FixedJumpMechanism(jump_t, events, coupled=False)
+
+    if jump is not None:
+        raise ValueError(
+            "`jump` was given without `jump_mechanism` or `jump_t`+`events`: "
+            "there is nothing to tell the solver when a jump occurs."
+        )
+    return None
 
 
 class AdaptiveStepsizeODESolver(metaclass=abc.ABCMeta):
@@ -39,9 +83,11 @@ class AdaptiveStepsizeODESolver(metaclass=abc.ABCMeta):
         solution = torch.empty(
             len(t), *self.y0.shape, dtype=self.y0.dtype, device=self.y0.device
         )
-        solution[0] = self.y0
         t = t.to(self.dtype)
+        # Before, not after, seeding solution[0]: `_before_integrate` is where a
+        # jump landing on the very first time point is folded into the state.
         self._before_integrate(t)
+        solution[0] = self.y0
         for i in range(1, len(t)):
             solution[i] = self._advance(t[i])
         return solution
@@ -64,18 +110,18 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
     order: int
 
     def __init__(
-        self,
-        func,
-        y0,
-        step_size=None,
-        grid_constructor=None,
-        interp="linear",
-        perturb=False,
-        jump_t=None,
-        events=None,
-        jump=None,
-        jump_mechanism=None,
-        **unused_kwargs,
+            self,
+            func,
+            y0,
+            step_size=None,
+            grid_constructor=None,
+            interp="linear",
+            perturb=False,
+            jump_t=None,
+            events=None,
+            jump=None,
+            jump_mechanism=None,
+            **unused_kwargs,
     ):
         self.atol = unused_kwargs.pop("atol")
         unused_kwargs.pop("rtol", None)
@@ -90,17 +136,23 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         self.step_size = step_size
         self.interp = interp
         self.perturb = perturb
+        # NB: jump_t is a *time*, so it must not be typed from the state dtype -
+        # doing so promotes the time grid to complex for a complex-valued state.
+        # It is cast to the grid dtype in `_merge_grid_points`.
         self.jump_t = (
-            torch.as_tensor(jump_t, dtype=self.dtype, device=self.device)
-            if jump_t is not None
-            else torch.tensor([], dtype=self.dtype, device=self.device)
+            torch.as_tensor(jump_t, device=self.device) if jump_t is not None else None
         )
         self.jump = jump
-        self.jump_mechanism = jump_mechanism
         self.events = (
             torch.as_tensor(events, dtype=self.y0.dtype, device=self.device)
             if events is not None
             else None
+        )
+        self.jump_mechanism = _resolve_jump_mechanism(
+            jump=jump,
+            jump_t=self.jump_t,
+            events=self.events,
+            jump_mechanism=jump_mechanism,
         )
 
         if step_size is None:
@@ -128,8 +180,8 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
 
             niters = torch.ceil((end_time - start_time) / step_size + 1).item()
             t_infer = (
-                torch.arange(0, niters, dtype=t.dtype, device=t.device) * step_size
-                + start_time
+                    torch.arange(0, niters, dtype=t.dtype, device=t.device) * step_size
+                    + start_time
             )
             t_infer[-1] = t[-1]
 
@@ -143,72 +195,125 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
 
     @property
     def _has_jumps(self):
-        return self.jump is not None or self.jump_mechanism is not None
+        return self.jump is not None and self.jump_mechanism is not None
+
+    def _merge_grid_points(self, time_grid):
+        """Fold prescribed discontinuity/event times into the integration grid.
+
+        Landing a step boundary exactly on every known event time is what keeps
+        the jump exact and the solver at its nominal order. When there is
+        nothing to merge the grid is returned untouched, so a solve without
+        jumps behaves exactly as it did before jump support existed - in
+        particular it stays differentiable with respect to `t`.
+        """
+        extra = []
+        for candidate in (
+            self.jump_t,
+            None if self.jump_mechanism is None else self.jump_mechanism.event_times,
+        ):
+            if candidate is not None and candidate.numel() > 0:
+                extra.append(
+                    torch.as_tensor(candidate).to(
+                        dtype=time_grid.dtype, device=time_grid.device
+                    )
+                )
+        if not extra:
+            return time_grid
+
+        extra = torch.cat(extra)
+        # Points outside the integration interval are not ours to integrate
+        # through; the endpoints are already in the grid.
+        extra = extra[(extra > time_grid[0]) & (extra < time_grid[-1])]
+        if extra.numel() == 0:
+            return time_grid
+
+        merged, _ = torch.sort(torch.cat([time_grid, extra]))
+        # De-duplicate without `unique`, which has no derivative.
+        keep = torch.ones(merged.shape, dtype=torch.bool, device=merged.device)
+        keep[1:] = merged[1:] != merged[:-1]
+        return merged[keep]
+
+    def _interpolant(self, t0, t1, y0, y1, f0):
+        """Dense output over ``[t0, t1]`` for the step that produced ``y1``."""
+        if self.interp == "linear":
+            return lambda t: self._linear_interp(t0, t1, y0, y1, t)
+        if self.interp == "cubic":
+            f1 = self.func(t1, y1)
+            return lambda t: self._cubic_hermite_interp(t0, y0, f0, t1, y1, f1, t)
+        raise ValueError(f"Unknown interpolation method {self.interp}")
 
     def integrate(self, t):
-        event_index = 0
-        time_grid = self.grid_constructor(self.func, self.y0, t)
-        time_grid = torch.concat([time_grid, self.jump_t], dim=0)
-        time_grid, _ = time_grid.sort()
-        time_grid = time_grid.unique()
+        time_grid = self._merge_grid_points(
+            self.grid_constructor(self.func, self.y0, t)
+        )
         assert time_grid[0] == t[0] and time_grid[-1] == t[-1]
 
         solution = torch.empty(
             len(t), *self.y0.shape, dtype=self.y0.dtype, device=self.y0.device
         )
-        solution[0] = self.y0
+
+        mechanism = self.jump_mechanism if self._has_jumps else None
+        y0 = self.y0
+        # Cadlag: an event sitting on the very first time point is already
+        # reflected in the value reported there.
+        if mechanism is not None and mechanism.has_event_at(time_grid[0]):
+            y0 = mechanism.apply_jump(time_grid[0], y0, self.jump)
+        solution[0] = y0
 
         j = 1
-        y0 = self.y0
-        for t0, t1 in zip(time_grid[:-1], time_grid[1:]):
-            dJ = torch.zeros_like(y0)
-            dt = t1 - t0
-            self.func.callback_step(t0, y0, dt)
-            dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
-            y1 = y0 + dy
-            t_event = t0
-            while j < len(t) and t1 >= t[j]:
-                if self.interp == "linear":
-                    if self._has_jumps:
-                        _, t_event, event_index = self._linear_interp_events(
-                            t0, t1, y0, y1, next_after(t_event), t[j], event_index, dJ
-                        )
-                    solution[j] = self._linear_interp(t0, t1, y0, y1, t[j]) + dJ
-                    if self._has_jumps:
-                        _, t_event, event_index = self._linear_interp_events(
-                            t0,
-                            t1,
-                            y0,
-                            y1,
-                            next_after(t_event),
-                            next_after(t1),
-                            event_index,
-                            dJ,
-                        )
-                elif self.interp == "cubic":
-                    f1 = self.func(t1, y1)
-                    if self._has_jumps:
-                        _, t_event, event_index = self._cubic_hermite_events(
-                            t0, y0, f0, t1, y1, f1, t_event, t[j], event_index
-                        )
-                    solution[j] = (
-                        self._cubic_hermite_interp(t0, y0, f0, t1, y1, f1, t[j]) + dJ
-                    )
-                    if self._has_jumps:
-                        _, t_event, event_index = self._cubic_hermite_events(
-                            t0, y0, f0, t1, y1, f1, t_event, next_after(t1), event_index
+        for t_start, t_end in zip(time_grid[:-1], time_grid[1:]):
+            t0 = t_start
+            n_events = 0
+            while t0 < t_end:
+                t1 = t_end
+                dt = t1 - t0
+                self.func.callback_step(t0, y0, dt)
+                dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
+                y1 = y0 + dy
+                interp = self._interpolant(t0, t1, y0, y1, f0)
+
+                t_event = None
+                if mechanism is not None:
+                    t_event = mechanism.next_event_time(interp, t0, t1)
+                    if t_event is not None and t_event < t1:
+                        # A state-dependent event fell strictly inside the step.
+                        # Retake the step so that it ends exactly on the event:
+                        # the solver then integrates up to the discontinuity at
+                        # full order and restarts from the post-jump state.
+                        t1 = t_event
+                        dt = t1 - t0
+                        dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
+                        y1 = y0 + dy
+                        interp = self._interpolant(t0, t1, y0, y1, f0)
+
+                # Output times strictly inside the step come from the dense
+                # output; the endpoint is handled below so that it can carry the
+                # post-jump value.
+                while j < len(t) and t[j] < t1:
+                    solution[j] = interp(t[j])
+                    j += 1
+
+                if t_event is not None:
+                    y1 = mechanism.apply_jump(t1, y1, self.jump)
+                    n_events += 1
+                    if n_events > MAX_EVENTS_PER_STEP:
+                        raise RuntimeError(
+                            f"More than {MAX_EVENTS_PER_STEP} events realised in "
+                            f"the single step [{float(t_start)}, {float(t_end)}]; "
+                            "the jump mechanism is not making progress."
                         )
 
-                else:
-                    raise ValueError(f"Unknown interpolation method {self.interp}")
-                j += 1
-            y0 = y1 + dJ
+                if j < len(t) and t[j] == t1:
+                    solution[j] = y1
+                    j += 1
+
+                t0, y0 = t1, y1
 
         return solution
 
     def integrate_until_event(self, t0, event_fn):
         assert (
-            self.step_size is not None
+                self.step_size is not None
         ), "Event handling for fixed step solvers currently requires `step_size` to be provided in options."
 
         t0 = t0.type_as(self.y0.abs())
@@ -264,89 +369,3 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
             return y1
         slope = (t - t0) / (t1 - t0)
         return y0 + slope * (y1 - y0)
-
-    def _linear_interp_events(
-        self, t0, t1, y0, y1, t_start, t_end, e_index, dJ: torch.Tensor
-    ):
-        def _linear_interp_with_jump(*args, dJ):
-            return self._linear_interp(*args) + dJ
-
-        # interp = partial(self._linear_interp, t0, t1, y0, y1)
-        # dJ = torch.zeros_like(y0)
-        interp = partial(_linear_interp_with_jump, t0, t1, y0, y1, dJ=dJ)
-        if isinstance(self.jump_mechanism, JumpMechanism):
-            t_event = self.jump_mechanism.find_event_time(interp, t_start, t_end)
-            while t_event < t_end:
-                dN = self.jump_mechanism.realise_event(t_event, interp(t_event))
-                dN = (
-                    dN[..., None, :]
-                    if self.jump_mechanism.kind == "coupled"
-                    else dN[..., None]
-                )
-                # If marked, shape of dN is (B...,n_events), else (B...)
-                y_event = interp(t_event)
-                # z.shape = (B...,L) Where L is the latent dimension
-                # If marked, shape of h is (B...,L,n_events), else (B...,L)
-                h = self.jump(
-                    t_event, self.jump_mechanism.latent_proj(y_event, enforce=False)
-                )
-                # If marked, the einsum will be a dot-like product, else a pointwise multiplication
-                jmp = h * dN
-                if self.jump_mechanism.kind == "coupled":
-                    jmp = jmp.sum(dim=-1)
-                # Apply the projection to the latent space. Projection MUST BE A VIEW OPERATION.
-                dJ_proj = self.jump_mechanism.latent_proj(dJ, enforce=True)
-                dJ_proj += jmp
-                t_event = self.jump_mechanism.find_event_time(
-                    interp, next_after(t_event), t_end
-                )
-            return dJ, t_event, None
-        else:
-            while e_index < len(self.jump_t) and t_end >= self.jump_t[e_index]:
-                y_event = interp(self.jump_t[e_index])
-                h = self.jump(self.jump_t[e_index], y_event)
-                dN = self.events[:, e_index]
-                shape = list(dN.shape) + [
-                    1 for _ in range(len(h.shape) - len(dN.shape))
-                ]
-                dJ += h * dN.reshape(shape)
-                e_index += 1
-            return dJ, None, e_index
-
-    def _cubic_hermite_events(self, t0, y0, f0, t1, y1, f1, t_start, t_end, e_index):
-        interp = partial(self._cubic_hermite_interp, t0, y0, f0, t1, y1, f1)
-        dJ = torch.zeros_like(y0)
-
-        if isinstance(self.jump_mechanism, JumpMechanism):
-            t_event = self.jump_mechanism.find_event_time(interp, t_start, t_end)
-            while t_event < t_end:
-                dN = self.jump_mechanism.realise_event(t_event, interp(t_event))
-                dN = (
-                    dN[..., None, :]
-                    if self.jump_mechanism.kind == "coupled"
-                    else dN[..., None]
-                )
-                y_event = interp(t_event)
-                h = self.jump(
-                    t_event, self.jump_mechanism.latent_proj(y_event, enforce=False)
-                )
-                jmp = h * dN
-                if self.jump_mechanism.kind == "coupled":
-                    jmp = jmp.sum(dim=-1)
-                dJ_proj = self.jump_mechanism.latent_proj(dJ, enforce=True)
-                dJ_proj += jmp[..., None]
-                t_event = self.jump_mechanism.find_event_time(
-                    interp, next_after(t_event), t_end
-                )
-            return dJ, t_event, e_index
-        else:
-            while e_index < len(self.jump_t) and t_end >= self.jump_t[e_index]:
-                y_event = interp(self.jump_t[e_index])
-                h = self.jump(self.jump_t[e_index], y_event)
-                dN = self.events[:, e_index]
-                shape = list(dN.shape) + [
-                    1 for _ in range(len(h.shape) - len(dN.shape))
-                ]
-                dJ += h * dN.reshape(shape)
-                e_index += 1
-            return dJ, None, e_index

@@ -1,13 +1,24 @@
 import abc
+import bisect
 from abc import abstractmethod
+from typing import Callable, Literal, Optional, Sequence
 
 import torch
-import bisect
-from typing import Sequence, Callable, Literal
 
 ### OURS
 
+
+def _scalar(t) -> float:
+    """Time value as a plain float, detached from any autograd graph."""
+    if isinstance(t, torch.Tensor):
+        return t.detach().item()
+    return float(t)
+
 JumpMechanismKind = Literal["coupled", "simple", "marked"]
+
+#: Hard cap on the number of events realised inside a single solver step. Guards
+#: against a mechanism that keeps reporting an event at the same instant.
+MAX_EVENTS_PER_STEP = 1024
 
 
 def standard_exponential_random(
@@ -38,13 +49,21 @@ class JumpMechanism(abc.ABC):
     """
     Handles operations related to jump mechanisms in a given context.
 
-    Provides functionalities to find event times and realize events,
-    allowing dynamic computations involving time and states.
+    A jump mechanism answers three questions for the solver:
+
+    1. *When* does the next event happen inside a step? -- :meth:`next_event_time`.
+    2. *Which* event streams fire at that instant? -- :meth:`realise_event`.
+    3. *Where* in the state does the jump land? -- :meth:`latent_proj` /
+       :meth:`scatter_jump`.
+
+    The solver drives the mechanism as follows. Event times are half-open on the
+    left: a scan of ``(t0, t1]`` never re-reports an event already realised at
+    ``t0``. The state is treated as càdlàg (right-continuous), so the value
+    reported at an event time is the *post*-jump state.
 
     Attributes:
         batch_dims (int): The number of batch dimensions in the system.
         events_t (list): A list to store event times.
-        marked (bool): Indicates if the mechanism is marked, affecting event handling.
 
     Notes:
         The jump is applied to the system after the latent projection.
@@ -61,7 +80,6 @@ class JumpMechanism(abc.ABC):
 
         Args:
             batch_dims (int): The number of batch dimensions to be used.
-            marked (bool): Indicates whether the instance is marked. Defaults to False.
             latent_proj (Callable[[torch.Tensor], torch.Tensor], optional): A function
                 that applies a projection to a latent tensor. Defaults to the identity
                 function if not provided.
@@ -70,6 +88,49 @@ class JumpMechanism(abc.ABC):
         self.events_t = []
         self._latent_proj = latent_proj if latent_proj is not None else lambda x: x
 
+    # ------------------------------------------------------------------ #
+    #                        Event discovery                             #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def event_times(self) -> Optional[torch.Tensor]:
+        """Event times known ahead of the solve, if any.
+
+        The solver merges these into its integration grid so that a step
+        boundary falls exactly on every event, which makes the jump exact and
+        keeps the solver at its nominal order. Return ``None`` when the event
+        times are state-dependent and can only be found by root-finding.
+        """
+        return None
+
+    def has_event_at(self, t: torch.Tensor) -> bool:
+        """Whether an unrealised event sits exactly at time ``t``.
+
+        Only used for the very first time point of a solve; every later event
+        is discovered through :meth:`next_event_time` on a half-open interval.
+        """
+        return False
+
+    def next_event_time(
+        self,
+        z_interp: Callable[[torch.Tensor], torch.Tensor],
+        t0: torch.Tensor,
+        t1: torch.Tensor,
+        tol: float = 1e-6,
+    ) -> Optional[torch.Tensor]:
+        """Earliest event time in the half-open interval ``(t0, t1]``.
+
+        Args:
+            z_interp: Interpolant of the state over ``[t0, t1]``.
+            t0: Exclusive lower bound of the scan.
+            t1: Inclusive upper bound of the scan.
+            tol: Absolute tolerance for state-dependent event location.
+
+        Returns:
+            The event time, or ``None`` when no event occurs in the interval.
+        """
+        raise NotImplementedError
+
     def find_event_time(
         self,
         z_interp: Callable[[torch.Tensor], torch.Tensor],
@@ -77,36 +138,129 @@ class JumpMechanism(abc.ABC):
         t1: torch.Tensor,
         tol: float = 1e-6,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        """Deprecated. Use :meth:`next_event_time`.
+
+        Kept for callers written against the original API. Returns ``t1`` when
+        no event occurs, which cannot be distinguished from an event landing
+        exactly on ``t1`` -- the reason it was replaced.
+        """
+        t1 = torch.as_tensor(t1)
+        t_event = self.next_event_time(z_interp, t0, t1, tol)
+        if t_event is None:
+            return t1
+        return torch.minimum(torch.as_tensor(t_event), t1)
 
     @abstractmethod
     def realise_event(self, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        pass
+        """Consume the event(s) at time ``t`` and return their indicator mask.
+
+        The mask has shape ``(*batch,)`` in ``simple`` mode and
+        ``(*batch, n_event_types)`` in ``coupled`` mode.
+        """
+
+    # ------------------------------------------------------------------ #
+    #                        Applying the jump                           #
+    # ------------------------------------------------------------------ #
 
     def latent_proj(self, z: torch.Tensor, enforce: bool = False) -> torch.Tensor:
         """
-        Projects the input latent tensor using a projection method and verifies
-        that the projection does not alter the base tensor.
+        Projects the input latent tensor using a projection method.
 
         Note:
-            The Jump mechanism alters the latent projection part.
+            The Jump mechanism alters the latent projection part only, so the
+            projection must be a *view* of ``z`` (or the identity) for
+            :meth:`scatter_jump` to be able to write through it.
 
         Args:
             z (torch.Tensor): The input latent tensor to be projected.
-            enforce (bool, optional): Whether to enforce that the projection does not alter the base tensor.
+            enforce (bool, optional): Whether to require that the projection
+                aliases ``z`` rather than copying it.
 
         Returns:
             torch.Tensor: The projected latent tensor.
 
         Raises:
-            RuntimeError: If the latent projection changes the base tensor.
+            RuntimeError: If ``enforce`` is set and the projection does not
+                alias the input tensor.
         """
         z_ = self._latent_proj(z)
-        if enforce and (z_ is z or z_._base is not z):
+        if enforce and z_ is not z and z_._base is not z:
             raise RuntimeError(
-                "The latent projection should not change the base Tensor"
+                "The latent projection must be a view of its input (or the "
+                "identity), otherwise the jump cannot be written back into "
+                "the state."
             )
         return z_
+
+    def scatter_jump(self, y: torch.Tensor, jmp: torch.Tensor) -> torch.Tensor:
+        """Return ``y`` with ``jmp`` added to its latent projection.
+
+        Coordinates outside the latent projection -- the cumulative hazards of a
+        survival model, for instance -- are left untouched.
+        """
+        dJ = torch.zeros_like(y)
+        dJ_proj = self.latent_proj(dJ, enforce=True)
+        dJ_proj += jmp
+        return y + dJ
+
+    def increment_from_mask(
+        self,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        jump_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        dN: torch.Tensor,
+    ) -> torch.Tensor:
+        """The state increment produced by an already-decided event mask.
+
+        Split out from :meth:`jump_increment` so that a recorded mask can be
+        replayed without re-deciding which events fire -- which is what makes
+        the adjoint pass reproduce the forward pass exactly.
+        """
+        kind = self.kind
+        if kind == "marked":
+            raise NotImplementedError(
+                "Marked jump mechanisms are not implemented yet."
+            )
+        h = jump_fn(t, self.latent_proj(y))
+        dN = dN.to(dtype=h.dtype, device=h.device)
+        if kind == "coupled":
+            jmp = (h * dN[..., None, :]).sum(dim=-1)
+        else:
+            jmp = h * dN[..., None]
+        dJ = torch.zeros_like(y)
+        dJ_proj = self.latent_proj(dJ, enforce=True)
+        dJ_proj += jmp
+        return dJ
+
+    def jump_increment(
+        self,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        jump_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Realise the events at ``t`` and return the increment ``y(t+) - y(t-)``.
+
+        Args:
+            t: The event time.
+            y: The pre-jump state ``y(t-)``.
+            jump_fn: The jump network ``h(t, z)``. It is evaluated on the latent
+                projection of ``y`` and must return ``(*batch, latent)`` in
+                ``simple`` mode or ``(*batch, latent, n_event_types)`` in
+                ``coupled`` mode.
+
+        Returns:
+            The state increment, zero outside the latent projection.
+        """
+        return self.increment_from_mask(t, y, jump_fn, self.realise_event(t, y))
+
+    def apply_jump(
+        self,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        jump_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Realise the events at ``t`` and return the post-jump state ``y(t+)``."""
+        return y + self.jump_increment(t, y, jump_fn)
 
     @property
     @abstractmethod
@@ -122,11 +276,14 @@ class FixedJumpMechanism(JumpMechanism):
     and to realize the impact of the events at specific times. Additionally, it
     maintains the state of all realized events up to a certain index.
 
+    Because the event times are known ahead of the solve they are reported
+    through :attr:`event_times` and merged into the solver's integration grid,
+    so each jump lands exactly on a step boundary.
+
     Attributes:
         events_mask (torch.Tensor): Mask representing the occurrence of events.
         events_t (torch.Tensor): Tensor containing the times at which events occur.
         idx (int): Index of the next event to be processed in the sequence.
-        marked (bool): Flag indicating if the mechanism is marked.
     """
 
     def __init__(
@@ -141,83 +298,109 @@ class FixedJumpMechanism(JumpMechanism):
         else:
             batch_dims = events_mask.dim() - 1
         super().__init__(batch_dims, latent_proj=latent_proj)
+        events_t = torch.as_tensor(events_t)
+        if events_t.dim() != 1:
+            raise ValueError("events_t must be a one-dimensional tensor.")
+        if events_t.numel() > 1 and (events_t[1:] < events_t[:-1]).any():
+            raise ValueError("events_t must be non-decreasing.")
+        n_times = events_mask.shape[-2] if coupled else events_mask.shape[-1]
+        if n_times != events_t.numel():
+            raise ValueError(
+                "events_mask must carry one entry per event time: expected "
+                f"{events_t.numel()} along the time axis, got {n_times}."
+            )
         self.events_mask = events_mask
         self.events_t = events_t
+        # Cached python floats: bisect on a tensor would rebuild this list on
+        # every call, which is O(n) inside the per-step event loop.
+        self._times = events_t.tolist()
         self.idx = 0
         self.coupled = coupled
 
-    def find_event_time(
+    @property
+    def event_times(self) -> Optional[torch.Tensor]:
+        """The prescribed event times."""
+        return self.events_t
+
+    def has_event_at(self, t: torch.Tensor) -> bool:
+        """Whether an unrealised event sits exactly at ``t``."""
+        tv = _scalar(t)
+        idx = bisect.bisect_left(self._times, tv, lo=self.idx)
+        return idx < len(self._times) and self._times[idx] == tv
+
+    def next_event_time(
         self,
         z_interp: Callable[[torch.Tensor], torch.Tensor],
         t0: torch.Tensor,
         t1: torch.Tensor,
         tol: float = 1e-6,
-    ):
+    ) -> Optional[torch.Tensor]:
         """
-        Finds the event time within a specified time range, interpolating using the
-        provided function and ensuring the time lies within the given tolerance.
+        Returns the earliest prescribed event time in ``(t0, t1]``.
 
-        This method searches for an event time within the range [t0, t1] using
-        binary search. The function `z_interp` is used to calculate interpolations
-        and enforce the tolerance constraint.
-
-        If no suitable event is found within the specified range, the method returns
-        the upper bound `t1`.
+        The interpolant is unused: the event times do not depend on the state.
 
         Args:
-            z_interp: A callable interpolation function that accepts a tensor as input
-                and returns a tensor, typically used for interpolating event values.
-            t0: A tensor representing the start of the time range within which to
-                search for the event.
-            t1: A tensor representing the end of the time range within which to
-                search for the event.
-            tol: A float specifying the allowed tolerance for the event time. Defaults
-                to 1e-6.
+            z_interp: Ignored.
+            t0: Exclusive lower bound of the scan.
+            t1: Inclusive upper bound of the scan.
+            tol: Ignored.
 
         Returns:
-            torch.Tensor: The event time found within the specified range, either the
-            closest match from `events_t` for the given tolerance or the upper bound
-            `t1` if no suitable event is found.
+            The event time, or ``None`` when no prescribed event falls in the
+            interval.
         """
         t0 = torch.as_tensor(t0)
         t1 = torch.as_tensor(t1)
-        idx = bisect.bisect_left(self.events_t.tolist(), t0, lo=self.idx)
-        if idx == len(self.events_t):
-            t = t1
-        else:
-            t = self.events_t[idx].to(device=t0.device)
-        return torch.minimum(t, t1)
+        idx = bisect.bisect_right(self._times, _scalar(t0), lo=self.idx)
+        if idx >= len(self._times):
+            return None
+        t_event = self.events_t[idx].to(device=t0.device)
+        if t_event > t1:
+            return None
+        return t_event
 
     def realise_event(self, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """
-        Realises an event based on the given time `t` and state `z`. This function determines
-        the occurrence of an event by finding the corresponding index in the pre-defined
-        event times and updates the internal pointer. If no events occur, it returns a
-        tensor of zeros with the same shape as the first column of the event mask.
+        Realises the event(s) prescribed at time ``t`` and advances the internal
+        pointer past them, so the same event can never be applied twice.
 
         Args:
             t: A tensor representing the time at which to evaluate the event.
             z: A tensor representing the state associated with the event.
 
         Returns:
-            A tensor representing the realised event mask at the given time. If no event
-            occurs, a tensor of zeros is returned with the appropriate shape.
+            A tensor representing the realised event mask at the given time. If
+            no event is prescribed at ``t``, a zero mask is returned.
         """
-        idx = bisect.bisect_left(self.events_t.tolist(), t, lo=self.idx)
-        self.idx = idx
-        if self.coupled:
-            if self.idx == len(self.events_t):
-                return torch.zeros_like(self.events_mask[..., 0, :])
-            return self.events_mask[..., idx, :].to_dense()
+        tv = _scalar(t)
+        idx = bisect.bisect_left(self._times, tv, lo=self.idx)
+        if idx >= len(self._times) or self._times[idx] != tv:
+            return torch.zeros_like(self._mask_row(0))
+        mask = self._mask_row(idx)
+        stop = idx + 1
+        # Several rows may share the same timestamp; consume all of them.
+        while stop < len(self._times) and self._times[stop] == tv:
+            mask = mask + self._mask_row(stop)
+            stop += 1
+        self.idx = stop
+        return mask
 
-        else:
-            if self.idx == len(self.events_t):
-                return torch.zeros_like(self.events_mask[..., 0])
-            return self.events_mask[..., idx].to_dense()
+    def _mask_row(self, i: int) -> torch.Tensor:
+        """The dense event mask prescribed at time index ``i``."""
+        row = (
+            self.events_mask[..., i, :]
+            if self.coupled
+            else self.events_mask[..., i]
+        )
+        return row.to_dense() if row.is_sparse else row
 
     @property
     def all_realised_events(self):
-        return self.events_mask[..., : self.idx + 1]
+        """The mask rows consumed so far, sliced along the time axis."""
+        if self.coupled:
+            return self.events_mask[..., : self.idx, :]
+        return self.events_mask[..., : self.idx]
 
     @property
     def kind(self) -> JumpMechanismKind:
@@ -309,8 +492,11 @@ class CoupledStochasticJumpMechanism(JumpMechanism):
         self._event_realisation = torch.where(
             self._event_counter < max_events, event_realisation, torch.inf
         )
+        # (time, crossing mask) memoised by the last successful event location.
+        self._located = None
 
     def detect_event(self, t: torch.Tensor, z: torch.Tensor) -> bool:
+        """Whether any cumulative hazard has crossed its threshold at ``t``."""
         return (
             (
                 self.cumulative_hazard_proj(t, z)
@@ -320,65 +506,90 @@ class CoupledStochasticJumpMechanism(JumpMechanism):
             .item()
         )
 
-    def _proj_fn(self, z_interp: Callable[[torch.Tensor], torch.Tensor]):
-        def proj_fn(t: torch.Tensor):
-            cumulative_hazards = self.cumulative_hazard_proj(t, z_interp(t))
-            if cumulative_hazards.dim() == self.batch_dims:
-                return cumulative_hazards
-            elif cumulative_hazards.dim() == self.batch_dims + 1:
-                raise ValueError("Currently, only one event is supported.")
-            return cumulative_hazards
-
-        return proj_fn
-
-    def find_event_time(
+    def next_event_time(
         self,
         z_interp: Callable[[torch.Tensor], torch.Tensor],
         t0: torch.Tensor,
         t1: torch.Tensor,
         tol: float = 1e-6,
-    ):
+    ) -> Optional[torch.Tensor]:
+        """
+        Locates the first threshold crossing in ``(t0, t1]`` by bisection.
+
+        The cumulative hazard is non-decreasing, so a crossing has happened
+        somewhere in the interval if and only if it has happened by ``t1``. That
+        makes a single check at ``t1`` a sound test for "is there an event at
+        all", and the bisection below only runs when there is one.
+
+        Args:
+            z_interp: Interpolant of the state over ``[t0, t1]``.
+            t0: Exclusive lower bound of the scan.
+            t1: Inclusive upper bound of the scan.
+            tol: Absolute tolerance on the located event time.
+
+        Returns:
+            The event time, or ``None`` when no threshold is crossed.
+        """
         t0 = torch.as_tensor(t0)
         t1 = torch.as_tensor(t1)
-        while not torch.allclose(t0, t1, atol=tol):
-            t_mid = (t0 + t1) / 2
-            if self.detect_event(t_mid, z_interp(t_mid)):
-                t1 = t_mid
+        self._located = None
+        if not self.detect_event(t1, z_interp(t1)):
+            return None
+        lo, hi = t0, t1
+        # Bisection on a monotone predicate: hi always satisfies it, lo never
+        # does, so the loop converges to the crossing from the right.
+        while (hi - lo) > tol:
+            mid = (lo + hi) / 2
+            if mid <= lo or mid >= hi:  # exhausted floating point resolution
+                break
+            if self.detect_event(mid, z_interp(mid)):
+                hi = mid
             else:
-                t0 = t_mid
-        return t1
+                lo = mid
+        # Memoise which streams crossed. The solver may retake the step so that
+        # it ends exactly here, and the recomputed state can then sit a hair on
+        # the wrong side of the threshold; the located crossing is authoritative.
+        z_hi = z_interp(hi)
+        crossed = self.cumulative_hazard_proj(hi, z_hi) >= self._event_realisation.to(
+            device=z_hi.device
+        )
+        self._located = (hi, crossed)
+        return hi
 
     def realise_event(self, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        realised = self.cumulative_hazard_proj(t, z) >= self._event_realisation.to(
-            device=z.device
-        )
+        """Consume the crossings at ``t`` and resample their thresholds."""
+        if self._located is not None and self._located[0] == t:
+            realised = self._located[1]
+            self._located = None
+        else:
+            realised = self.cumulative_hazard_proj(t, z) >= self._event_realisation.to(
+                device=z.device
+            )
         indexes = torch.argwhere(realised)
         if len(indexes) == 0:
             raise ValueError("No event detected during realisation.")
         if self.batch_dims == 0:
-            if self.coupled:  # If marked, we need to store the event index
+            if self.coupled:  # Record which event type fired
                 for idx in indexes:
                     self._realised_events.append([t, idx.item()])
                     self._event_counter[idx.item()] += 1
-            else:  # If not marked, we just append the event time
+            else:  # Otherwise just record the event time
                 self._realised_events.append(t)
                 self._event_counter += 1
-        else:  # Batch size = 1
+        else:
             for idx in indexes:
-                if self.coupled:  # If marked, we need to store the event index
+                if self.coupled:  # Record which event type fired
                     self._realised_events[idx[0].item()].append([t, idx[1].item()])
-                else:  # If not marked, we just append the event time
+                else:  # Otherwise just record the event time
                     self._realised_events[idx.item()].append(t)
                 self._event_counter[
                     tuple(idx.to(device=self._event_counter.device))
                 ] += 1
 
-        torch.where(self._event_counter >= self.max_events, 0, 0)
-
         delta_event = realised.float().to(
             device=self._event_realisation.device
         ) * standard_exponential_random(realised.shape, generator=self.rng)
-        # Sample an event time for next event, or +inf if events are exhausted
+        # Sample a threshold for the next event, or +inf if events are exhausted.
         self._event_realisation += torch.where(
             self._event_counter < self.max_events, delta_event, torch.inf
         )

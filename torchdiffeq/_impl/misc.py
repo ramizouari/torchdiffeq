@@ -294,6 +294,19 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
         t_is_reversed = True
 
     if t_is_reversed:
+        if options.get("jump_mechanism") is not None or options.get("events") is not None:
+            # Time normalisation negates t and hides that from `func`, but a
+            # state jump y(t+) = y(t-) + h(t, y(t-)) is not invertible in
+            # general, so running it backwards is not a matter of flipping
+            # signs. Refuse rather than return a plausible wrong answer.
+            raise NotImplementedError(
+                "Jump ODEs cannot be integrated with decreasing `t`: the jump "
+                "map y(t+) = y(t-) + h(t, y(t-)) is not invertible in general. "
+                "Integrate forwards and reverse the solution. (If this came "
+                "from odeint_adjoint, the backward pass inherited the jump "
+                "options; jump-aware adjoints go through odeint_jump_adjoint.)"
+            )
+
         # Change the integration times to ascending order.
         # We do this by negating the time values and all associated arguments.
         t = -t
@@ -365,7 +378,9 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
         else:
             setattr(func, callback_name, callback)
 
-    invalid_callbacks = callback_names - SOLVERS[method].valid_callbacks()
+    # `method` may be a solver class rather than one of the registered names.
+    solver_cls = SOLVERS[method] if isinstance(method, str) else method
+    invalid_callbacks = callback_names - solver_cls.valid_callbacks()
     if len(invalid_callbacks) > 0:
         warnings.warn(
             "Solver '{}' does not support callbacks {}".format(
