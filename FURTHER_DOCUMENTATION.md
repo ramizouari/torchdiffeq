@@ -21,6 +21,8 @@ For these solvers, `rtol` and `atol` correspond to the tolerances for accepting/
 
 - `norm`: What norm to compute the accept/reject criterion with respect to. Given tensor input, this defaults to an RMS norm. Given tupled input, this defaults to computing an RMS norm over each tensor, and then taking a max over the tuple, producing a mixed L-infinity/RMS norm. If passed this should be a function consuming a tensor/tuple with the same shape as `y0`, and return a scalar corresponding to its norm. When passed as part of `adjoint_options`, then the special value `"seminorm"` may be used to zero out the contribution from the parameters, as per the ["Hey, that's not an ODE"](https://arxiv.org/abs/2009.09457) paper.
 
+- `jump=None`,<br>`jump_mechanism=None`: Jump support; see [Jump options](#jump-options) below.
+
 **Fixed solvers (euler, midpoint, rk4, explicit_adams, implicit_adams):**<br>
 
 - `step_size=None`: How large each discrete step should be. If not passed then this defaults to stepping between the values of `t`. Note that if using `t` just to specify the start and end of the regions of integration, then it is very important to specify this argument! It is mutually exclusive with the `grid_constructor` argument, below.
@@ -45,6 +47,95 @@ For this solver, `rtol` and `atol` correspond to the tolerance for convergence o
 
 **scipy_solver:**<br>
 - `solver`: which SciPy solver to use; corresponds to the `'method'` argument of `scipy.integrate.solve_ivp`.
+
+## Jump options
+
+Every solver except `scipy_solver` can integrate a *jump ODE*, whose solution is
+piecewise continuous:
+
+```
+dy/dt = f(t, y)          between events
+y(t+) = y(t-) + h(t, y(t-))    at each event time t
+```
+
+The solution is treated as càdlàg (right-continuous): the value reported at an
+event time is the *post*-jump state. Two options control this, and they must be
+passed together:
+
+- `jump=None`: The jump map `h(t, z)`, called with the event time and the latent
+  projection of the pre-jump state. In uncoupled mode it returns a tensor shaped
+  like its input; in coupled mode it returns `(*batch, latent, n_event_types)`,
+  one jump per event type.
+
+- `jump_mechanism=None`: A `JumpMechanism`, which decides *when* events happen
+  and *which* event streams fire. Three are provided:
+
+  - `FixedJumpMechanism(events_t, events_mask, coupled=False, latent_proj=None)`:
+    events at prescribed times. Because the times are known ahead of the solve
+    they are merged into the integration grid, so every jump lands exactly on a
+    step boundary and the solver keeps its nominal order.
+
+  - `SimpleStochasticJumpMechanism(batch_shape, cumulative_hazards_proj=None, rng=None, latent_proj=None)`:
+    a single event stream per batch element, fired when a cumulative hazard
+    carried in the state crosses an exponential threshold. Use
+    `cumulative_hazards_proj(t, z)` to say which coordinates of the state hold
+    the cumulative hazard.
+
+  - `CoupledStochasticJumpMechanism(batch_shape, coupling_dim, cumulative_hazards_proj=None, rng=None, latent_proj=None, max_events=inf)`:
+    as above with `coupling_dim` competing event types, each with its own hazard
+    and its own column of `h`. `max_events` caps the number of events per stream.
+
+  Custom mechanisms subclass `JumpMechanism` and implement `next_event_time` and
+  `realise_event`. State-dependent event times are located from the solver's
+  dense output and the step is retaken to end exactly on the event, so the
+  interpolant never straddles a discontinuity.
+
+`latent_proj` restricts the jump to part of the state: coordinates outside it -
+the cumulative hazards of a survival model, for instance - are left untouched.
+It must be a *view* of its input (e.g. `lambda z: z[..., :k]`), so that the jump
+can be written back into the state.
+
+The older `jump_t` + `events` spelling is still accepted and is equivalent to a
+`FixedJumpMechanism` in uncoupled mode acting on the whole state. Passing
+`jump_t` on its own keeps its upstream meaning - a discontinuity in `f` that the
+grid should land on - and produces no state jump.
+
+The multistep solvers (`explicit_adams`, `implicit_adams`) restart at every
+event: their stored derivatives lie on the other side of the discontinuity, so
+the predictor cannot extrapolate through them. They therefore fall back to their
+startup order locally, and a single-step solver is the better choice on a problem
+with many events.
+
+Jump ODEs can only be integrated with increasing `t`: the jump map is not
+invertible in general, so a decreasing `t` raises rather than returning a
+plausible wrong answer.
+
+### Gradients through jumps
+
+`odeint` is differentiable through jumps by backpropagation as usual.
+`odeint_adjoint` is **not** jump-aware: its backward sweep integrates straight
+through the discontinuity and returns gradients for the jump-free problem. Use
+`odeint_jump_adjoint` instead, which takes the same arguments:
+
+```python
+from torchdiffeq import odeint_jump_adjoint
+
+y = odeint_jump_adjoint(func, y0, t, method="dopri5",
+                        options={"jump": h, "jump_mechanism": mechanism})
+```
+
+It discovers the event times in a `torch.no_grad()` forward pass, then replays
+them differentiably: each smooth segment between events goes through
+`odeint_adjoint` and keeps its O(1) memory profile, and the jump map itself is
+differentiated by plain autograd, linking consecutive segments into one graph.
+Recording the events rather than re-deciding them matters -- a stochastic
+mechanism would otherwise draw fresh thresholds and simulate a different
+trajectory. With no jump arguments this is exactly `odeint_adjoint`.
+
+Gradients flow to `y0`, to the parameters of `func` and to the parameters of the
+jump network. Not differentiated: the event *times* of a state-dependent
+mechanism, which get the same treatment `odeint_event` gives event times. For a
+`FixedJumpMechanism` the times are data, so there is nothing to drop.
 
  ## Adjoint options
 
