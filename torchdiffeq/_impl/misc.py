@@ -190,7 +190,7 @@ class _PerturbFunc(torch.nn.Module):
         super(_PerturbFunc, self).__init__()
         self.base_func = base_func
 
-    def forward(self, t, y, *, perturb=Perturb.NONE, dN=None):
+    def forward(self, t, y, *, perturb=Perturb.NONE):
         assert isinstance(
             perturb, Perturb
         ), "perturb argument must be of type Perturb enum"
@@ -209,10 +209,7 @@ class _PerturbFunc(torch.nn.Module):
         else:
             # Do nothing.
             pass
-        if dN is None:
-            return self.base_func(t, y)
-        else:
-            return self.base_func(t, y, dN=dN)
+        return self.base_func(t, y)
 
 
 def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
