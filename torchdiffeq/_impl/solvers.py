@@ -6,13 +6,6 @@ from .misc import _handle_unused_kwargs
 from .jump import MAX_EVENTS_PER_STEP, FixedJumpMechanism, JumpMechanism
 
 
-def next_after(x: torch.Tensor) -> torch.Tensor:
-    """
-    Returns the next representable floating-point value after x in the direction of infinity.
-    """
-    return torch.nextafter(x, torch.tensor(torch.inf, device=x.device, dtype=x.dtype))
-
-
 def _resolve_jump_mechanism(jump, jump_t, events, jump_mechanism):
     """Normalise the two jump APIs onto a single :class:`JumpMechanism`.
 
@@ -233,6 +226,15 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         keep[1:] = merged[1:] != merged[:-1]
         return merged[keep]
 
+    def _restart(self):
+        """Discard any state carried across steps, after a jump.
+
+        A single-step method has nothing to discard, so this is a no-op here. A
+        multistep method extrapolates from derivatives evaluated at earlier
+        steps; those lie on the other side of the discontinuity, so continuing
+        to use them silently drops the method below its nominal order.
+        """
+
     def _interpolant(self, t0, t1, y0, y1, f0):
         """Dense output over ``[t0, t1]`` for the step that produced ``y1``."""
         if self.interp == "linear":
@@ -258,6 +260,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         # reflected in the value reported there.
         if mechanism is not None and mechanism.has_event_at(time_grid[0]):
             y0 = mechanism.apply_jump(time_grid[0], y0, self.jump)
+            self._restart()
         solution[0] = y0
 
         j = 1
@@ -295,6 +298,9 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
 
                 if t_event is not None:
                     y1 = mechanism.apply_jump(t1, y1, self.jump)
+                    # The state is discontinuous at t1, so anything a multistep
+                    # method remembers from before it is no longer usable.
+                    self._restart()
                     n_events += 1
                     if n_events > MAX_EVENTS_PER_STEP:
                         raise RuntimeError(

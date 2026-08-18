@@ -290,6 +290,20 @@ def test_implicit_fixed_grid_honours_a_jump(method):
     assert out[-1, 0, 0].item() == pytest.approx(exact(), abs=1e-2)
 
 
+@pytest.mark.parametrize("method", ["explicit_adams", "implicit_adams", "fixed_adams"])
+def test_multistep_restarts_at_a_jump(method):
+    """A multistep method must drop its history when the state jumps.
+
+    The stored derivatives lie on the other side of the discontinuity, so a
+    predictor that keeps extrapolating through them loses most of its accuracy.
+
+    # regression: the Adams solvers carried their history across the jump and
+    # were three orders of magnitude less accurate than they are here.
+    """
+    out = solve([0.31337], method=method, step_size=1e-3)
+    assert out[-1, 0, 0].item() == pytest.approx(exact(), abs=1e-6)
+
+
 def test_fixed_grid_and_adaptive_agree():
     fixed = solve([0.2, 0.55, 0.9], method="rk4", step_size=1e-4)
     adaptive = solve([0.2, 0.55, 0.9], method="dopri5")
