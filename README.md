@@ -80,6 +80,37 @@ See example of simulating and differentiating through a bouncing ball in [`examp
 <img align="middle" src="./assets/bouncing_ball.png" alt="Bouncing Ball" width="500" height="250" />
 </p>
 
+## Jump ODEs
+
+Solutions with jumps -- piecewise continuous trajectories -- are supported by every solver except `scipy_solver`:
+
+```
+dy/dt = f(t, y)                between events
+y(t+) = y(t-) + h(t, y(t-))    at each event time t
+```
+
+The jump map `h` and a *jump mechanism* deciding when events fire are passed through `options`:
+
+```python
+from torchdiffeq import odeint
+from torchdiffeq.jump import FixedJumpMechanism
+
+mechanism = FixedJumpMechanism(event_times, event_mask)
+y = odeint(func, y0, t, method="dopri5", options={"jump": h, "jump_mechanism": mechanism})
+```
+
+Event times may be prescribed (`FixedJumpMechanism`), or drawn from a hazard rate carried in the state
+(`SimpleStochasticJumpMechanism`, `CoupledStochasticJumpMechanism` for competing event types); custom
+mechanisms subclass `JumpMechanism`. A state-dependent event is located from the solver's dense output and
+the step is retaken to end exactly on it, so the solver integrates up to the discontinuity at full order and
+restarts from the post-jump state.
+
+For adjoint-mode gradients use `odeint_jump_adjoint`, which takes the same arguments as `odeint_adjoint`;
+the plain `odeint_adjoint` is not jump-aware and its backward pass would integrate straight through the
+discontinuity. See the [further documentation](FURTHER_DOCUMENTATION.md#jump-options) for the option list,
+and [docs/](docs/) for the mathematical framework, an API reference, worked examples, solver selection,
+and troubleshooting.
+
 ## Keyword arguments for odeint(_adjoint)
 
 #### Keyword arguments:

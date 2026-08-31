@@ -3,19 +3,29 @@ import collections
 import torch
 from .event_handling import find_event
 from .interp import _interp_evaluate, _interp_fit
-from .misc import (_compute_error_ratio,
-                   _select_initial_step,
-                   _optimal_step_size,
-                   _handle_unused_kwargs)
+from .misc import (
+    _compute_error_ratio,
+    _select_initial_step,
+    _optimal_step_size,
+    _handle_unused_kwargs,
+)
 from .misc import Perturb
-from .solvers import AdaptiveStepsizeEventODESolver, FixedGridODESolver
+from .solvers import (
+    AdaptiveStepsizeEventODESolver,
+    FixedGridODESolver,
+    _resolve_jump_mechanism,
+)
 import warnings
 
+_ButcherTableau = collections.namedtuple(
+    "_ButcherTableau", "alpha, beta, c_sol, c_error"
+)
 
-_ButcherTableau = collections.namedtuple('_ButcherTableau', 'alpha, beta, c_sol, c_error')
+_RungeKuttaState = collections.namedtuple(
+    "_RungeKuttaState", "y1, f1, t0, t1, dt, dJ, interp_coeff"
+)
 
 
-_RungeKuttaState = collections.namedtuple('_RungeKuttaState', 'y1, f1, t0, t1, dt, interp_coeff')
 # Saved state of the Runge Kutta solver.
 #
 # Attributes:
@@ -69,14 +79,14 @@ def _runge_kutta_step(func, y0, f0, t0, dt, t1, tableau):
     k = torch.empty(*f0.shape, len(tableau.alpha) + 1, dtype=y0.dtype, device=y0.device)
     k = _UncheckedAssign.apply(k, f0, (..., 0))
     for i, (alpha_i, beta_i) in enumerate(zip(tableau.alpha, tableau.beta)):
-        if alpha_i == 1.:
+        if alpha_i == 1.0:
             # Always step to perturbing just before the end time, in case of discontinuities.
             ti = t1
             perturb = Perturb.PREV
         else:
             ti = t0 + alpha_i * dt
             perturb = Perturb.NONE
-        yi = y0 + torch.sum(k[..., :i + 1] * (beta_i * dt), dim=-1).view_as(f0)
+        yi = y0 + torch.sum(k[..., : i + 1] * (beta_i * dt), dim=-1).view_as(f0)
         f = func(ti, yi, perturb=perturb)
         k = _UncheckedAssign.apply(k, f, (..., i + 1))
 
@@ -114,13 +124,15 @@ def rk4_alt_step_func(func, t0, dt, t1, y0, f0=None, perturb=False):
         k1 = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
     k2 = func(t0 + dt * _one_third, y0 + dt * k1 * _one_third)
     k3 = func(t0 + dt * _two_thirds, y0 + dt * (k2 - k1 * _one_third))
-    k4 = func(t1, y0 + dt * (k1 - k2 + k3), perturb=Perturb.PREV if perturb else Perturb.NONE)
+    k4 = func(
+        t1, y0 + dt * (k1 - k2 + k3), perturb=Perturb.PREV if perturb else Perturb.NONE
+    )
     return (k1 + 3 * (k2 + k3) + k4) * dt * 0.125
 
 
 def rk3_step_func(func, t0, dt, t1, y0, butcher_tableu=None, f0=None, perturb=False):
     """butcher_tableu should be of the form
-    
+
     [
         [0  , 0     , 0     ,   0],
         [c_2, a_{21}, 0     ,   0],
@@ -135,8 +147,15 @@ def rk3_step_func(func, t0, dt, t1, y0, butcher_tableu=None, f0=None, perturb=Fa
         k1 = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
 
     k2 = func(t0 + dt * butcher_tableu[1][0], y0 + dt * k1 * butcher_tableu[1][1])
-    k3 = func(t0 + dt * butcher_tableu[2][0], y0 + dt * (k1 * butcher_tableu[2][1] + k2 * butcher_tableu[2][2]))
-    return dt * (k1 * butcher_tableu[3][1] + k2 * butcher_tableu[3][2] + k3 * butcher_tableu[3][3])
+    k3 = func(
+        t0 + dt * butcher_tableu[2][0],
+        y0 + dt * (k1 * butcher_tableu[2][1] + k2 * butcher_tableu[2][2]),
+    )
+    return dt * (
+            k1 * butcher_tableu[3][1]
+            + k2 * butcher_tableu[3][2]
+            + k3 * butcher_tableu[3][3]
+    )
 
 
 def rk2_step_func(func, t0, dt, t1, y0, butcher_tableu=None, f0=None, perturb=False):
@@ -154,7 +173,11 @@ def rk2_step_func(func, t0, dt, t1, y0, butcher_tableu=None, f0=None, perturb=Fa
     if k1 is None:
         k1 = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
 
-    k2 = func(t0 + dt * butcher_tableu[1][0], y0 + dt * k1 * butcher_tableu[1][1], perturb=Perturb.PREV if perturb else Perturb.NONE)
+    k2 = func(
+        t0 + dt * butcher_tableu[1][0],
+        y0 + dt * k1 * butcher_tableu[1][1],
+        perturb=Perturb.PREV if perturb else Perturb.NONE,
+    )
     return dt * (k1 * butcher_tableu[2][1] + k2 * butcher_tableu[2][2])
 
 
@@ -163,18 +186,27 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
     tableau: _ButcherTableau
     mid: torch.Tensor
 
-    def __init__(self, func, y0, rtol, atol,
-                 min_step=0,
-                 max_step=float('inf'),
-                 first_step=None,
-                 step_t=None,
-                 jump_t=None,
-                 safety=0.9,
-                 ifactor=10.0,
-                 dfactor=0.2,
-                 max_num_steps=2 ** 31 - 1,
-                 dtype=torch.float64,
-                 **kwargs):
+    def __init__(
+            self,
+            func,
+            y0,
+            rtol,
+            atol,
+            min_step=0,
+            max_step=float("inf"),
+            first_step=None,
+            step_t=None,
+            jump_t=None,
+            events=None,
+            jump=None,
+            jump_mechanism=None,
+            safety=0.9,
+            ifactor=10.0,
+            dfactor=0.2,
+            max_num_steps=2 ** 31 - 1,
+            dtype=torch.float64,
+            **kwargs
+    ):
         super(RKAdaptiveStepsizeODESolver, self).__init__(dtype=dtype, y0=y0, **kwargs)
 
         # We use mixed precision. y has its original dtype (probably float32), whilst all 'time'-like objects use
@@ -187,38 +219,114 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         self.atol = torch.as_tensor(atol, dtype=dtype, device=device)
         self.min_step = torch.as_tensor(min_step, dtype=dtype, device=device)
         self.max_step = torch.as_tensor(max_step, dtype=dtype, device=device)
-        self.first_step = None if first_step is None else torch.as_tensor(first_step, dtype=dtype, device=device)
+        self.first_step = (
+            None
+            if first_step is None
+            else torch.as_tensor(first_step, dtype=dtype, device=device)
+        )
         self.safety = torch.as_tensor(safety, dtype=dtype, device=device)
         self.ifactor = torch.as_tensor(ifactor, dtype=dtype, device=device)
         self.dfactor = torch.as_tensor(dfactor, dtype=dtype, device=device)
-        self.max_num_steps = torch.as_tensor(max_num_steps, dtype=torch.int32, device=device)
+        self.max_num_steps = torch.as_tensor(
+            max_num_steps, dtype=torch.int32, device=device
+        )
         self.dtype = dtype
 
-        self.step_t = None if step_t is None else torch.as_tensor(step_t, dtype=dtype, device=device)
-        self.jump_t = None if jump_t is None else torch.as_tensor(jump_t, dtype=dtype, device=device)
-
+        self.step_t = (
+            None
+            if step_t is None
+            else torch.as_tensor(step_t, dtype=dtype, device=device)
+        )
+        self.jump_t = (
+            None
+            if jump_t is None
+            else torch.as_tensor(jump_t, dtype=dtype, device=device)
+        )
+        self.jump = jump
+        self.events = (
+            None
+            if events is None
+            else torch.as_tensor(events, dtype=y0.dtype, device=device)
+        )
+        self.jump_mechanism = _resolve_jump_mechanism(
+            jump=jump,
+            jump_t=self.jump_t,
+            events=self.events,
+            jump_mechanism=jump_mechanism,
+        )
+        # Time of a state-dependent event located inside a step but not yet
+        # reached: the next step is truncated so that it ends exactly there.
+        self._pending_event_t = None
         # Copy from class to instance to set device
-        self.tableau = _ButcherTableau(alpha=self.tableau.alpha.to(device=device, dtype=y0.dtype),
-                                       beta=[b.to(device=device, dtype=y0.dtype) for b in self.tableau.beta],
-                                       c_sol=self.tableau.c_sol.to(device=device, dtype=y0.dtype),
-                                       c_error=self.tableau.c_error.to(device=device, dtype=y0.dtype))
+        self.tableau = _ButcherTableau(
+            alpha=self.tableau.alpha.to(device=device, dtype=y0.dtype),
+            beta=[b.to(device=device, dtype=y0.dtype) for b in self.tableau.beta],
+            c_sol=self.tableau.c_sol.to(device=device, dtype=y0.dtype),
+            c_error=self.tableau.c_error.to(device=device, dtype=y0.dtype),
+        )
         self.mid = self.mid.to(device=device, dtype=y0.dtype)
 
     @classmethod
     def valid_callbacks(cls):
-        return super(RKAdaptiveStepsizeODESolver, cls).valid_callbacks() | {'callback_step',
-                                                                            'callback_accept_step',
-                                                                            'callback_reject_step'}
+        return super(RKAdaptiveStepsizeODESolver, cls).valid_callbacks() | {
+            "callback_step",
+            "callback_accept_step",
+            "callback_reject_step",
+        }
+
+    @property
+    def _has_jumps(self):
+        return self.jump is not None and self.jump_mechanism is not None
+
+    def _realise_jump(self, t, y):
+        """The jump increment at ``t``, or ``None`` when no event fires there."""
+        if not self._has_jumps:
+            return None
+        if self._pending_event_t is not None:
+            # A state-dependent event located by `_adaptive_step`.
+            if t == self._pending_event_t:
+                self._pending_event_t = None
+                return self.jump_mechanism.jump_increment(t, y, self.jump)
+            return None
+        if self.jump_mechanism.event_times is not None and (
+            self.jump_mechanism.has_event_at(t)
+        ):
+            return self.jump_mechanism.jump_increment(t, y, self.jump)
+        return None
 
     def _before_integrate(self, t):
         t0 = t[0]
+        # An adaptive step may overshoot the last requested time and interpolate
+        # back, so event location has to be capped at the horizon: realising an
+        # event past it would consume a threshold the caller never asked about.
+        # In event mode (a single time) there is no horizon.
+        self._t_final = t[-1] if len(t) > 1 else None
+        self._pending_event_t = None
+        # Cadlag: an event sitting on the very first time point is already
+        # reflected in the state reported there.
+        if self._has_jumps and self.jump_mechanism.has_event_at(t0):
+            self.y0 = self.jump_mechanism.apply_jump(t0, self.y0, self.jump)
         f0 = self.func(t[0], self.y0)
         if self.first_step is None:
-            first_step = _select_initial_step(self.func, t[0], self.y0, self.order - 1, self.rtol, self.atol,
-                                              self.norm, f0=f0)
+            first_step = _select_initial_step(
+                self.func,
+                t[0],
+                self.y0,
+                self.order - 1,
+                self.rtol,
+                self.atol,
+                self.norm,
+                f0=f0,
+            )
         else:
             first_step = self.first_step
-        self.rk_state = _RungeKuttaState(self.y0, f0, t[0], t[0], first_step, [self.y0] * 5)
+
+        # dJ carries a jump that has been realised at t1 but not yet folded into
+        # the state, so that the step's interpolant stays consistent with the
+        # pre-jump value it was fitted to. `None` means "no jump pending".
+        self.rk_state = _RungeKuttaState(
+            self.y0, f0, t[0], t[0], first_step, None, [self.y0] * 5
+        )
 
         # Handle step_t and jump_t arguments.
         if self.step_t is None:
@@ -226,28 +334,55 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         else:
             step_t = _sort_tvals(self.step_t, t0)
             step_t = step_t.to(self.dtype)
-        if self.jump_t is None:
+        # Prescribed event times join jump_t: the step-boundary machinery then
+        # lands a step exactly on each of them, which makes the jump exact.
+        jump_t_values = [] if self.jump_t is None else [self.jump_t]
+        if self._has_jumps:
+            event_times = self.jump_mechanism.event_times
+            if event_times is not None and event_times.numel() > 0:
+                jump_t_values.append(
+                    event_times.to(dtype=self.dtype, device=self.y0.device)
+                )
+        if not jump_t_values:
             jump_t = torch.tensor([], dtype=self.dtype, device=self.y0.device)
+        elif len(jump_t_values) == 1:
+            jump_t = _sort_tvals(jump_t_values[0], t0).to(self.dtype)
         else:
-            jump_t = _sort_tvals(self.jump_t, t0)
-            jump_t = jump_t.to(self.dtype)
+            jump_t = _sort_tvals(torch.cat(jump_t_values).unique(), t0).to(self.dtype)
         counts = torch.cat([step_t, jump_t]).unique(return_counts=True)[1]
         if (counts > 1).any():
-            raise ValueError("`step_t` and `jump_t` must not have any repeated elements between them.")
+            raise ValueError(
+                "`step_t` and `jump_t` must not have any repeated elements between them."
+            )
 
         self.step_t = step_t
         self.jump_t = jump_t
-        self.next_step_index = min(bisect.bisect(self.step_t.tolist(), t[0]), len(self.step_t) - 1)
-        self.next_jump_index = min(bisect.bisect(self.jump_t.tolist(), t[0]), len(self.jump_t) - 1)
+        self.next_step_index = min(
+            bisect.bisect(self.step_t.tolist(), t[0]), len(self.step_t) - 1
+        )
+        self.next_jump_index = min(
+            bisect.bisect(self.jump_t.tolist(), t[0]), len(self.jump_t) - 1
+        )
 
     def _advance(self, next_t):
         """Interpolate through the next time point, integrating as necessary."""
         n_steps = 0
         while next_t > self.rk_state.t1:
-            assert n_steps < self.max_num_steps, 'max_num_steps exceeded ({}>={})'.format(n_steps, self.max_num_steps)
+            assert (
+                    n_steps < self.max_num_steps
+            ), "max_num_steps exceeded ({}>={})".format(n_steps, self.max_num_steps)
             self.rk_state = self._adaptive_step(self.rk_state)
             n_steps += 1
-        return _interp_evaluate(self.rk_state.interp_coeff, self.rk_state.t0, self.rk_state.t1, next_t)
+        z = _interp_evaluate(
+            self.rk_state.interp_coeff, self.rk_state.t0, self.rk_state.t1, next_t
+        )
+        # The interpolant is fitted to the pre-jump value at t1. A jump realised
+        # there is folded in here for the reported solution (cadlag) and again
+        # at the start of the next step for the state carried forward; it must
+        # not be cleared in between, since `_advance` is a read-only query.
+        if self.rk_state.dJ is not None and next_t == self.rk_state.t1:
+            z = z + self.rk_state.dJ
+        return z
 
     def _advance_until_event(self, event_fn):
         """Returns t, state(t) such that event_fn(t, state(t)) == 0."""
@@ -257,15 +392,30 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         n_steps = 0
         sign0 = torch.sign(event_fn(self.rk_state.t1, self.rk_state.y1))
         while sign0 == torch.sign(event_fn(self.rk_state.t1, self.rk_state.y1)):
-            assert n_steps < self.max_num_steps, 'max_num_steps exceeded ({}>={})'.format(n_steps, self.max_num_steps)
+            assert (
+                    n_steps < self.max_num_steps
+            ), "max_num_steps exceeded ({}>={})".format(n_steps, self.max_num_steps)
             self.rk_state = self._adaptive_step(self.rk_state)
             n_steps += 1
-        interp_fn = lambda t: _interp_evaluate(self.rk_state.interp_coeff, self.rk_state.t0, self.rk_state.t1, t)
-        return find_event(interp_fn, sign0, self.rk_state.t0, self.rk_state.t1, event_fn, self.atol)
+        interp_fn = lambda t: _interp_evaluate(
+            self.rk_state.interp_coeff, self.rk_state.t0, self.rk_state.t1, t
+        )
+        return find_event(
+            interp_fn, sign0, self.rk_state.t0, self.rk_state.t1, event_fn, self.atol
+        )
 
     def _adaptive_step(self, rk_state):
         """Take an adaptive Runge-Kutta step to integrate the ODE."""
-        y0, f0, _, t0, dt, interp_coeff = rk_state
+        y0_m, f0, _, t0, dt, dJ, interp_coeff = rk_state
+        # y0_m = y(t0-). A jump realised at t0 is folded in here, at the start of
+        # the step that leaves it, so that the previous step's interpolant stays
+        # consistent with the pre-jump value it was fitted to.
+        if dJ is None:
+            y0 = y0_m
+        else:
+            y0 = y0_m + dJ
+            # f is discontinuous across the jump; re-evaluate on the new side.
+            f0 = self.func(t0, y0, perturb=Perturb.NEXT)
         if not torch.isfinite(dt):
             dt = self.min_step
         dt = dt.clamp(self.min_step, self.max_step)
@@ -283,8 +433,8 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         ########################################################
         #                      Assertions                      #
         ########################################################
-        assert t0 + dt > t0, 'underflow in dt {}'.format(dt.item())
-        assert torch.isfinite(y0).all(), 'non-finite values in state `y`: {}'.format(y0)
+        assert t0 + dt > t0, "underflow in dt {}".format(dt.item())
+        assert torch.isfinite(y0).all(), "non-finite values in state `y`: {}".format(y0)
 
         ########################################################
         #     Make step, respecting prescribed grid points     #
@@ -307,10 +457,21 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
                 t1 = next_jump_t
                 dt = t1 - t0
 
+        # A state-dependent event was located inside an earlier attempt at this
+        # step. End the step exactly on it so that the jump is applied at the
+        # right instant and the interpolant never straddles the discontinuity.
+        if self._pending_event_t is not None and t0 < self._pending_event_t < t0 + dt:
+            on_step_t = False
+            on_jump_t = False
+            t1 = self._pending_event_t
+            dt = t1 - t0
+
         # Must be arranged as doing all the step_t handling, then all the jump_t handling, in case we
         # trigger both. (i.e. interleaving them would be wrong.)
 
-        y1, f1, y1_error, k = _runge_kutta_step(self.func, y0, f0, t0, dt, t1, tableau=self.tableau)
+        y1, f1, y1_error, k = _runge_kutta_step(
+            self.func, y0, f0, t0, dt, t1, tableau=self.tableau
+        )
         # dtypes:
         # y1.dtype == self.y0.dtype
         # f1.dtype == self.y0.dtype
@@ -320,7 +481,9 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         ########################################################
         #                     Error Ratio                      #
         ########################################################
-        error_ratio = _compute_error_ratio(y1_error, self.rtol, self.atol, y0, y1, self.norm)
+        error_ratio = _compute_error_ratio(
+            y1_error, self.rtol, self.atol, y0, y1, self.norm
+        )
         accept_step = error_ratio <= 1
 
         # Handle min max stepping
@@ -333,31 +496,76 @@ class RKAdaptiveStepsizeODESolver(AdaptiveStepsizeEventODESolver):
         # error_ratio.dtype == self.dtype
 
         ########################################################
+        #                    Event location                    #
+        ########################################################
+        # For a state-dependent mechanism the event time is only known once the
+        # step has been taken, from its dense output. If it lands strictly
+        # inside the step, the step is retaken so that it ends on the event.
+        forced_dt = None
+        new_interp_coeff = None
+        if accept_step and self._has_jumps and self._pending_event_t is None:
+            if self.jump_mechanism.event_times is None:
+                new_interp_coeff = self._interp_fit(y0, y1, k, dt)
+                interp = lambda tt: _interp_evaluate(  # noqa: E731
+                    new_interp_coeff, t0, t1, tt
+                )
+                t_search = t1
+                if self._t_final is not None and t_search > self._t_final:
+                    t_search = self._t_final
+                t_event = (
+                    None
+                    if t_search <= t0
+                    else self.jump_mechanism.next_event_time(interp, t0, t_search)
+                )
+                if t_event is not None:
+                    if t_event < t1 and (t_event - t0) > self.min_step:
+                        self._pending_event_t = t_event
+                        accept_step = False
+                        forced_dt = t_event - t0
+                    else:
+                        # Already on the event, or too close to resolve it any
+                        # finer: apply the jump at the end of this step.
+                        self._pending_event_t = t1
+
+        ########################################################
         #                   Update RK State                    #
         ########################################################
         if accept_step:
             self.func.callback_accept_step(t0, y0, dt)
             t_next = t1
             y_next = y1
-            interp_coeff = self._interp_fit(y0, y_next, k, dt)
+            interp_coeff = (
+                new_interp_coeff
+                if new_interp_coeff is not None
+                else self._interp_fit(y0, y_next, k, dt)
+            )
             if on_step_t:
                 if self.next_step_index != len(self.step_t) - 1:
                     self.next_step_index += 1
             if on_jump_t:
-                if self.next_jump_index != len(self.jump_t) - 1:
-                    self.next_jump_index += 1
                 # We've just passed a discontinuity in f; we should update f to match the side of the discontinuity
                 # we're now on.
                 f1 = self.func(t_next, y_next, perturb=Perturb.NEXT)
+                if self.next_jump_index != len(self.jump_t) - 1:
+                    self.next_jump_index += 1
+            dJ_next = self._realise_jump(t_next, y_next)
             f_next = f1
         else:
             self.func.callback_reject_step(t0, y0, dt)
             t_next = t0
-            y_next = y0
+            y_next = y0_m
             f_next = f0
-        dt_next = _optimal_step_size(dt, error_ratio, self.safety, self.ifactor, self.dfactor, self.order)
-        dt_next = dt_next.clamp(self.min_step, self.max_step)
-        rk_state = _RungeKuttaState(y_next, f_next, t0, t_next, dt_next, interp_coeff)
+            dJ_next = dJ
+        if forced_dt is not None:
+            dt_next = forced_dt
+        else:
+            dt_next = _optimal_step_size(
+                dt, error_ratio, self.safety, self.ifactor, self.dfactor, self.order
+            )
+            dt_next = dt_next.clamp(self.min_step, self.max_step)
+        rk_state = _RungeKuttaState(
+            y_next, f_next, t0, t_next, dt_next, dJ_next, interp_coeff
+        )
         return rk_state
 
     def _interp_fit(self, y0, y1, k, dt):
@@ -379,39 +587,45 @@ class FixedGridFIRKODESolver(FixedGridODESolver):
     order: int
     tableau: _ButcherTableau
 
-    def __init__(self, func, y0, step_size=None, grid_constructor=None, interp='linear', perturb=False, max_iters=100, **unused_kwargs):
-
+    def __init__(
+            self,
+            func,
+            y0,
+            step_size=None,
+            grid_constructor=None,
+            interp="linear",
+            perturb=False,
+            max_iters=100,
+            jump_t=None,
+            events=None,
+            jump=None,
+            jump_mechanism=None,
+            **unused_kwargs
+    ):
+        # Delegate to the base solver rather than restating its constructor:
+        # duplicating it is how the jump attributes went missing here.
+        super().__init__(
+            func,
+            y0,
+            step_size=step_size,
+            grid_constructor=grid_constructor,
+            interp=interp,
+            perturb=perturb,
+            jump_t=jump_t,
+            events=events,
+            jump=jump,
+            jump_mechanism=jump_mechanism,
+            **unused_kwargs,
+        )
         self.max_iters = max_iters
-        self.atol = unused_kwargs.pop('atol')
-        unused_kwargs.pop('rtol', None)
-        unused_kwargs.pop('norm', None)
-        _handle_unused_kwargs(self, unused_kwargs)
-        del unused_kwargs
 
-        self.func = func
-        self.y0 = y0
-        self.dtype = y0.dtype
-        self.device = y0.device
-        self.step_size = step_size
-        self.interp = interp
-        self.perturb = perturb
+        self.tableau = _ButcherTableau(
+            alpha=self.tableau.alpha.to(device=self.device, dtype=y0.dtype),
+            beta=[b.to(device=self.device, dtype=y0.dtype) for b in self.tableau.beta],
+            c_sol=self.tableau.c_sol.to(device=self.device, dtype=y0.dtype),
+            c_error=self.tableau.c_error.to(device=self.device, dtype=y0.dtype),
+        )
 
-        if step_size is None:
-            if grid_constructor is None:
-                self.grid_constructor = lambda f, y0, t: t
-            else:
-                self.grid_constructor = grid_constructor
-        else:
-            if grid_constructor is None:
-                self.grid_constructor = self._grid_constructor_from_step_size(step_size)
-            else:
-                raise ValueError("step_size and grid_constructor are mutually exclusive arguments.")
-            
-        self.tableau = _ButcherTableau(alpha=self.tableau.alpha.to(device=self.device, dtype=y0.dtype),
-                                       beta=[b.to(device=self.device, dtype=y0.dtype) for b in self.tableau.beta],
-                                       c_sol=self.tableau.c_sol.to(device=self.device, dtype=y0.dtype),
-                                       c_error=self.tableau.c_error.to(device=self.device, dtype=y0.dtype))
-        
     def _step_func(self, func, t0, dt, t1, y0):
         if not isinstance(t0, torch.Tensor):
             t0 = torch.tensor(t0)
@@ -420,7 +634,7 @@ class FixedGridFIRKODESolver(FixedGridODESolver):
         if not isinstance(t1, torch.Tensor):
             t1 = torch.tensor(t1)
         f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
-        
+
         t_dtype = y0.abs().dtype
         tol = 1e-8
         if t_dtype == torch.float64:
@@ -456,35 +670,38 @@ class FixedGridFIRKODESolver(FixedGridODESolver):
             newf = self._residual(func, k, y, t0, dt, t1)
             z = newf - f
             f = newf
-            J = J + (torch.outer ((z - torch.linalg.vecdot(J,s)),s)) / (torch.dot(s,s))
+            J = J + (torch.outer((z - torch.linalg.vecdot(J, s)), s)) / (
+                torch.dot(s, s)
+            )
 
         if not converged:
-            warnings.warn('Functional iteration did not converge. Solution may be incorrect.')
+            warnings.warn(
+                "Functional iteration did not converge. Solution may be incorrect."
+            )
 
         dy = torch.matmul(k, dt * self.tableau.c_sol)
 
         return dy, f0
-    
+
     def _residual(self, func, K, y, t0, dt, t1):
         res = torch.zeros_like(K)
         for i, (y_i, alpha_i) in enumerate(zip(y, self.tableau.alpha)):
             perturb = Perturb.NONE
-            if alpha_i == 1.:
+            if alpha_i == 1.0:
                 ti = t1
                 perturb = Perturb.PREV
-            elif alpha_i == 0.:
+            elif alpha_i == 0.0:
                 if not torch.all(self.tableau.beta[i]):
                     # Same slope as stored so skip
                     continue
                 ti = t0
             else:
                 ti = t0 + alpha_i * dt
-            res[...,i] = K[...,i] - func(ti, y_i, perturb=perturb)
+            res[..., i] = K[..., i] - func(ti, y_i, perturb=perturb)
         return res.flatten()
-    
+
 
 class FixedGridDIRKODESolver(FixedGridFIRKODESolver):
-
     def _step_func(self, func, t0, dt, t1, y0):
         if not isinstance(t0, torch.Tensor):
             t0 = torch.tensor(t0)
@@ -493,7 +710,7 @@ class FixedGridDIRKODESolver(FixedGridFIRKODESolver):
         if not isinstance(t1, torch.Tensor):
             t1 = torch.tensor(t1)
         f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
-        
+
         t_dtype = y0.abs().dtype
         tol = 1e-8
         if t_dtype == torch.float64:
@@ -507,12 +724,14 @@ class FixedGridDIRKODESolver(FixedGridFIRKODESolver):
 
         k = [f0.clone()] * len(self.tableau.alpha)
 
-        for i, (alpha_i, beta_i) in enumerate(zip(self.tableau.alpha, self.tableau.beta)):
+        for i, (alpha_i, beta_i) in enumerate(
+                zip(self.tableau.alpha, self.tableau.beta)
+        ):
             perturb = Perturb.NONE
-            if alpha_i == 1.:
+            if alpha_i == 1.0:
                 ti = t1
                 perturb = Perturb.PREV
-            elif alpha_i == 0.:
+            elif alpha_i == 0.0:
                 if not torch.all(self.tableau.beta[i]):
                     # Same slope as stored so skip
                     continue
@@ -520,7 +739,7 @@ class FixedGridDIRKODESolver(FixedGridFIRKODESolver):
             else:
                 ti = t0 + alpha_i * dt
 
-            k_i = torch.stack(k[:i+1], -1)
+            k_i = torch.stack(k[: i + 1], -1)
 
             # Broyden's Method to solve the system of nonlinear equations
             y_i = torch.matmul(k_i, beta_i * dt).add(y0)
@@ -539,20 +758,24 @@ class FixedGridDIRKODESolver(FixedGridFIRKODESolver):
                     break
 
                 k[i] = k[i] + s.reshape_as(k[i])
-                k_i = torch.stack(k[:i+1], -1)
+                k_i = torch.stack(k[: i + 1], -1)
                 y_i = torch.matmul(k_i, beta_i * dt).add(y0)
                 newf = self._residual(func, k_i, y_i, ti, perturb)
                 z = newf - f
                 f = newf
-                J = J + (torch.outer ((z - torch.linalg.vecdot(J,s)),s)) / (torch.dot(s,s))
+                J = J + (torch.outer((z - torch.linalg.vecdot(J, s)), s)) / (
+                    torch.dot(s, s)
+                )
 
             if not converged:
-                warnings.warn('Functional iteration did not converge. Solution may be incorrect.')
+                warnings.warn(
+                    "Functional iteration did not converge. Solution may be incorrect."
+                )
 
         dy = torch.matmul(torch.stack(k, -1), dt * self.tableau.c_sol)
 
         return dy, f0
-    
+
     def _residual(self, func, K, y, t, perturb):
-        res = K[...,-1] - func(t, y, perturb=perturb)
+        res = K[..., -1] - func(t, y, perturb=perturb)
         return res.flatten()

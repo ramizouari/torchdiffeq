@@ -187,6 +187,14 @@ class AdamsBashforthMoulton(FixedGridODESolver):
             self.prev_f.appendleft(f)
             self.prev_t = t
 
+    def _restart(self):
+        # A jump has made the state discontinuous. The stored derivatives were
+        # evaluated on the other side of it, so the predictor must not
+        # extrapolate through them; drop them and let the order build up again
+        # from the RK4 startup steps.
+        self.prev_f.clear()
+        self.prev_t = None
+
     def _has_converged(self, y0, y1):
         """Checks that each element is within the error tolerance."""
         error_ratio = _compute_error_ratio(torch.abs(y0 - y1), self.rtol, self.atol, y0, y1, _linf_norm)

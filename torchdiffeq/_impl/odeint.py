@@ -17,36 +17,38 @@ from .misc import _check_inputs, _flat_to_shape
 from .interp import _interp_evaluate
 
 SOLVERS = {
-    'dopri8': Dopri8Solver,
-    'dopri5': Dopri5Solver,
-    'tsit5': Tsit5Solver,
-    'bosh3': Bosh3Solver,
-    'fehlberg2': Fehlberg2,
-    'adaptive_heun': AdaptiveHeunSolver,
-    'euler': Euler,
-    'midpoint': Midpoint,
-    'heun2': Heun2,
-    'heun3': Heun3,
-    'rk4': RK4,
-    'explicit_adams': AdamsBashforth,
-    'implicit_adams': AdamsBashforthMoulton,
-    'implicit_euler': ImplicitEuler,
-    'implicit_midpoint': ImplicitMidpoint,
-    'trapezoid': Trapezoid,
-    'radauIIA3': RadauIIA3,
-    'gl4': GaussLegendre4,
-    'radauIIA5': RadauIIA5,
-    'gl6': GaussLegendre6,
-    'sdirk2': SDIRK2,
-    'trbdf2': TRBDF2,
+    "dopri8": Dopri8Solver,
+    "dopri5": Dopri5Solver,
+    "tsit5": Tsit5Solver,
+    "bosh3": Bosh3Solver,
+    "fehlberg2": Fehlberg2,
+    "adaptive_heun": AdaptiveHeunSolver,
+    "euler": Euler,
+    "midpoint": Midpoint,
+    "heun2": Heun2,
+    "heun3": Heun3,
+    "rk4": RK4,
+    "explicit_adams": AdamsBashforth,
+    "implicit_adams": AdamsBashforthMoulton,
+    "implicit_euler": ImplicitEuler,
+    "implicit_midpoint": ImplicitMidpoint,
+    "trapezoid": Trapezoid,
+    "radauIIA3": RadauIIA3,
+    "gl4": GaussLegendre4,
+    "radauIIA5": RadauIIA5,
+    "gl6": GaussLegendre6,
+    "sdirk2": SDIRK2,
+    "trbdf2": TRBDF2,
     # Backward compatibility: use the same name as before
-    'fixed_adams': AdamsBashforthMoulton,
+    "fixed_adams": AdamsBashforthMoulton,
     # ~Backwards compatibility
-    'scipy_solver': ScipyWrapperODESolver,
+    "scipy_solver": ScipyWrapperODESolver,
 }
 
 
-def odeint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, event_fn=None):
+def odeint(
+        func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, event_fn=None
+):
     """Integrate a system of ordinary differential equations.
 
     Solves the initial value problem for a non-stiff system of first order ODEs:
@@ -87,9 +89,22 @@ def odeint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, even
         ValueError: if an invalid `method` is provided.
     """
 
-    shapes, func, y0, t, rtol, atol, method, options, event_fn, t_is_reversed = _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS)
-
-    solver = SOLVERS[method](func=func, y0=y0, rtol=rtol, atol=atol, **options)
+    (
+        shapes,
+        func,
+        y0,
+        t,
+        rtol,
+        atol,
+        method,
+        options,
+        event_fn,
+        t_is_reversed,
+    ) = _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS)
+    if isinstance(method, str):
+        solver = SOLVERS[method](func=func, y0=y0, rtol=rtol, atol=atol, **options)
+    else:
+        solver = method(func=func, y0=y0, rtol=rtol, atol=atol, **options)
 
     if event_fn is None:
         solution = solver.integrate(t)
@@ -109,19 +124,22 @@ def odeint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, even
 
 
 def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options=None):
-
     assert torch.is_tensor(y0)  # TODO: handle tuple of tensors
 
     t = torch.tensor([t0, t1]).to(t0)
 
-    shapes, func, y0, t, rtol, atol, method, options, _, _ = _check_inputs(func, y0, t, rtol, atol, method, options, None, SOLVERS)
+    shapes, func, y0, t, rtol, atol, method, options, _, _ = _check_inputs(
+        func, y0, t, rtol, atol, method, options, None, SOLVERS
+    )
 
     assert method == "dopri5"
 
-    solver = Dopri5Solver(func=func, y0=y0, rtol=rtol, atol=atol, **options)    
-    
+    solver = Dopri5Solver(func=func, y0=y0, rtol=rtol, atol=atol, **options)
+
     # The integration loop
-    solution = torch.empty(len(t), *solver.y0.shape, dtype=solver.y0.dtype, device=solver.y0.device)
+    solution = torch.empty(
+        len(t), *solver.y0.shape, dtype=solver.y0.dtype, device=solver.y0.device
+    )
     solution[0] = solver.y0
     t = t.to(solver.dtype)
     solver._before_integrate(t)
@@ -142,7 +160,9 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
                 times.append(t1)
                 interp_coeffs.append(torch.stack(solver.rk_state.interp_coeff))
 
-        solution[i] = _interp_evaluate(solver.rk_state.interp_coeff, solver.rk_state.t0, solver.rk_state.t1, next_t)
+        solution[i] = _interp_evaluate(
+            solver.rk_state.interp_coeff, solver.rk_state.t0, solver.rk_state.t1, next_t
+        )
 
     times = torch.stack(times).reshape(-1).cpu()
     interp_coeffs = torch.stack(interp_coeffs)
@@ -157,7 +177,9 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
     return dense_output_fn
 
 
-def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface=odeint, **kwargs):
+def odeint_event(
+        func, y0, t0, *, event_fn, reverse_time=False, odeint_interface=odeint, **kwargs
+):
     """Automatically links up the gradient from the event time."""
 
     if reverse_time:
@@ -168,7 +190,9 @@ def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface
     event_t, solution = odeint_interface(func, y0, t, event_fn=event_fn, **kwargs)
 
     # Dummy values for rtol, atol, method, and options.
-    shapes, _func, _, t, _, _, _, _, event_fn, _ = _check_inputs(func, y0, t, 0.0, 0.0, None, None, event_fn, SOLVERS)
+    shapes, _func, _, t, _, _, _, _, event_fn, _ = _check_inputs(
+        func, y0, t, 0.0, 0.0, None, None, event_fn, SOLVERS
+    )
 
     if shapes is not None:
         state_t = torch.cat([s[-1].reshape(-1) for s in solution])
@@ -179,7 +203,9 @@ def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface
     if reverse_time:
         event_t = -event_t
 
-    event_t, state_t = ImplicitFnGradientRerouting.apply(_func, event_fn, event_t, state_t)
+    event_t, state_t = ImplicitFnGradientRerouting.apply(
+        _func, event_fn, event_t, state_t
+    )
 
     # Return the user expected time value.
     if reverse_time:
@@ -187,7 +213,9 @@ def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface
 
     if shapes is not None:
         state_t = _flat_to_shape(state_t, (), shapes)
-        solution = tuple(torch.cat([s[:-1], s_t[None]], dim=0) for s, s_t in zip(solution, state_t))
+        solution = tuple(
+            torch.cat([s[:-1], s_t[None]], dim=0) for s, s_t in zip(solution, state_t)
+        )
     else:
         solution = torch.cat([solution[:-1], state_t[None]], dim=0)
 
@@ -195,10 +223,9 @@ def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface
 
 
 class ImplicitFnGradientRerouting(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, func, event_fn, event_t, state_t):
-        """ event_t is the solution to event_fn """
+        """event_t is the solution to event_fn"""
         ctx.func = func
         ctx.event_fn = event_fn
         ctx.save_for_backward(event_t, state_t)
