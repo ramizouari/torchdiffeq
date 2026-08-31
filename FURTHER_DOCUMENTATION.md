@@ -50,6 +50,9 @@ For this solver, `rtol` and `atol` correspond to the tolerance for convergence o
 
 ## Jump options
 
+> Longer-form documentation — the mathematical framework, worked examples,
+> solver selection and troubleshooting — is in [docs/](docs/).
+
 Every solver except `scipy_solver` can integrate a *jump ODE*, whose solution is
 piecewise continuous:
 

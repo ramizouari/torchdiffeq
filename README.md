@@ -107,7 +107,9 @@ restarts from the post-jump state.
 
 For adjoint-mode gradients use `odeint_jump_adjoint`, which takes the same arguments as `odeint_adjoint`;
 the plain `odeint_adjoint` is not jump-aware and its backward pass would integrate straight through the
-discontinuity. See the [further documentation](FURTHER_DOCUMENTATION.md#jump-options) for details.
+discontinuity. See the [further documentation](FURTHER_DOCUMENTATION.md#jump-options) for the option list,
+and [docs/](docs/) for the mathematical framework, an API reference, worked examples, solver selection,
+and troubleshooting.
 
 ## Keyword arguments for odeint(_adjoint)
 
